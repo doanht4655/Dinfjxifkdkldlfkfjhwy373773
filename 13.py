@@ -471,7 +471,7 @@ def get_bypass_code(type_code):
         # Mapping các loại mã với URL và pattern tương ứng
         bypass_configs = {
             'm88': {
-                'url': 'https://traffic-user.net/GET_MA.php?codexn=taodeptrai&url=https://bet88ec.com/cach-danh-bai-sam-loc&loai_traffic=https://bet88ec.com/&clk=1000',
+                'url': 'https://traffic-user.net/GET_MA.php?codexn=taodeptrailamnhe&url=https://bet88ve.com/keo-moneyline-la-gi/&loai_traffic=https://bet88ve.com/&clk=1000',
                 'pattern': 'layma_me_vuatraffic'
             },
             'fb88': {

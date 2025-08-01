@@ -2809,7 +2809,6 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== BOT CONTROL COMMANDS ==========
 
-@check_bot_active(['batbot'])
 async def batbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lệnh bật bot (chỉ Master Admin)"""
     user_id = update.effective_user.id
@@ -2845,7 +2844,6 @@ async def batbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Bot đã được bật và thông báo đã được gửi tới tất cả người dùng."
     )
 
-@check_bot_active(['tatbot'])
 async def tatbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lệnh tắt bot (chỉ Master Admin)"""
     user_id = update.effective_user.id
@@ -2882,7 +2880,6 @@ async def tatbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Bot đã được tắt và thông báo đã được gửi tới tất cả người dùng."
     )
 
-@check_bot_active(['hentacbot'])
 async def hentacbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Hẹn tắt bot (chỉ Master Admin)"""
     user_id = update.effective_user.id
@@ -2937,7 +2934,6 @@ async def hentacbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Vui lòng kiểm tra lại định dạng thời gian."
         )
 
-@check_bot_active(['henbatbot'])
 async def henbatbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Hẹn bật bot (chỉ Master Admin)"""
     user_id = update.effective_user.id
@@ -2992,7 +2988,6 @@ async def henbatbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Vui lòng kiểm tra lại định dạng thời gian."
         )
 
-@check_bot_active(['danhsachlichhen'])
 async def danhsachlichhen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xem danh sách lịch hẹn (chỉ Master Admin)"""
     user_id = update.effective_user.id
@@ -3032,7 +3027,6 @@ async def danhsachlichhen_command(update: Update, context: ContextTypes.DEFAULT_
     
     await update.message.reply_html(message)
 
-@check_bot_active(['huylichhen'])
 async def huylichhen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Hủy lịch hẹn (chỉ Master Admin)"""
     user_id = update.effective_user.id
@@ -3068,7 +3062,6 @@ async def huylichhen_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Lịch hẹn có thể đã được thực hiện hoặc không tồn tại."
         )
 
-@check_bot_active(['thongbao'])
 async def thongbao_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gửi thông báo tới tất cả (chỉ Master Admin)"""
     user_id = update.effective_user.id

@@ -470,7 +470,6 @@ def broadcast_message(message):
         return
     
     # Tạo task async để gửi broadcast
-    import asyncio
     try:
         # Tạo event loop mới nếu không có
         loop = asyncio.new_event_loop()
@@ -764,7 +763,10 @@ def load_all_data():
     load_scheduled_tasks()
     load_key_metadata()
     load_key_usage_log()
-    logger.info(f"Đã tải dữ liệu thành công!")
+    
+    # Dọn dẹp KEY hết hạn ngay khi khởi động
+    cleaned = cleanup_expired_keys()
+    logger.info(f"✅ Đã tải dữ liệu thành công! Dọn dẹp {cleaned} KEY hết hạn")
 
 # Luồng tự động lưu dữ liệu định kỳ
 def auto_save_data_loop():
@@ -2738,22 +2740,6 @@ def start_auto_cleanup():
     logger.info("🧹 Auto cleanup system đã khởi động (mỗi 5 phút)")
 
 # ========== LOAD ALL DATA ON STARTUP ==========
-def load_all_data():
-    """Load tất cả dữ liệu khi khởi động"""
-    logger.info("📊 Đang load dữ liệu...")
-    load_valid_keys()
-    load_user_keys()
-    load_key_devices()
-    load_key_metadata()
-    load_key_usage_log()
-    load_admins()
-    load_ban_list()
-    
-    # Dọn dẹp KEY hết hạn ngay khi khởi động
-    cleaned = cleanup_expired_keys()
-    
-    logger.info(f"✅ Đã load hoàn tất - Dọn dẹp {cleaned} KEY hết hạn")
-
 # ========== LỆNH INFO HỆ THỐNG ==========
 @check_bot_active()
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3176,6 +3162,131 @@ def parse_schedule_time(schedule_text):
     raise ValueError("Định dạng thời gian không được hỗ trợ")
 
 # ========== ĐĂNG KÝ LỆNH BOT ==========
+# ========== ADMIN UTILITY FUNCTIONS ==========
+def ban_user(user_id, minutes):
+    """Ban user trong x phút"""
+    global BAN_LIST
+    ban_until = int(time.time()) + (minutes * 60)
+    BAN_LIST[user_id] = ban_until
+    save_ban_list()
+
+def unban_user(user_id):
+    """Unban user"""
+    global BAN_LIST
+    if user_id in BAN_LIST:
+        del BAN_LIST[user_id]
+        save_ban_list()
+
+def add_admin(user_id):
+    """Thêm admin mới"""
+    global ADMINS
+    if user_id not in ADMINS:
+        ADMINS.append(user_id)
+        save_admins()
+
+def remove_admin(user_id):
+    """Xóa admin"""
+    global ADMINS
+    if user_id in ADMINS:
+        ADMINS.remove(user_id)
+        save_admins()
+
+# ========== ADMIN COMMANDS ==========
+@check_bot_active()
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_html("🚫 <b>Lệnh này chỉ dành cho admin!</b>")
+        return
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_html("❌ <b>Sử dụng:</b> <code>/ban [user_id] [phút]</code>")
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+        ban_minutes = int(context.args[1])
+        
+        # Không thể ban admin khác
+        if is_admin(target_user_id):
+            await update.message.reply_html("🚫 <b>Không thể ban admin khác!</b>")
+            return
+        
+        ban_user(target_user_id, ban_minutes)
+        await update.message.reply_html(
+            f"✅ <b>Đã ban user {target_user_id} trong {ban_minutes} phút!</b>"
+        )
+    except ValueError:
+        await update.message.reply_html("❌ <b>ID user và thời gian phải là số!</b>")
+
+@check_bot_active()
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_html("🚫 <b>Lệnh này chỉ dành cho admin!</b>")
+        return
+    
+    if not context.args:
+        await update.message.reply_html("❌ <b>Sử dụng:</b> <code>/unban [user_id]</code>")
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+        unban_user(target_user_id)
+        await update.message.reply_html(f"✅ <b>Đã unban user {target_user_id}!</b>")
+    except ValueError:
+        await update.message.reply_html("❌ <b>ID user phải là số!</b>")
+
+@check_bot_active()
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html("🚫 <b>Chỉ Master Admin mới có thể thêm admin!</b>")
+        return
+    
+    if not context.args:
+        await update.message.reply_html("❌ <b>Sử dụng:</b> <code>/addadmin [user_id]</code>")
+        return
+    
+    try:
+        new_admin_id = int(context.args[0])
+        add_admin(new_admin_id)
+        await update.message.reply_html(f"✅ <b>Đã thêm admin {new_admin_id}!</b>")
+    except ValueError:
+        await update.message.reply_html("❌ <b>ID user phải là số!</b>")
+
+@check_bot_active()
+async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html("🚫 <b>Chỉ Master Admin mới có thể xóa admin!</b>")
+        return
+    
+    if not context.args:
+        await update.message.reply_html("❌ <b>Sử dụng:</b> <code>/deladmin [user_id]</code>")
+        return
+    
+    try:
+        admin_id = int(context.args[0])
+        if admin_id == MASTER_ADMIN_ID:
+            await update.message.reply_html("🚫 <b>Không thể xóa Master Admin!</b>")
+            return
+        
+        remove_admin(admin_id)
+        await update.message.reply_html(f"✅ <b>Đã xóa admin {admin_id}!</b>")
+    except ValueError:
+        await update.message.reply_html("❌ <b>ID user phải là số!</b>")
+
+@check_bot_active()
+async def adminguide_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_html("🚫 <b>Lệnh này chỉ dành cho admin!</b>")
+        return
+    
+    await update.message.reply_html(ADMIN_GUIDE)
+
+# ========== BOT COMMANDS SETUP ==========
 async def set_bot_commands(application):
     commands = [
         BotCommand("start", "🏠 Trang chủ và hướng dẫn chính"),
@@ -3253,7 +3364,11 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("deleteallkeys", deleteallkeys_command))
     application.add_handler(CommandHandler("savedata", savedata_command))
     application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler(["ban", "unban", "addadmin", "deladmin", "adminguide"], ym_command))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
+    application.add_handler(CommandHandler("addadmin", addadmin_command))
+    application.add_handler(CommandHandler("deladmin", deladmin_command))
+    application.add_handler(CommandHandler("adminguide", adminguide_command))
     
     # Bot Control Commands (Master Admin Only)
     application.add_handler(CommandHandler("batbot", batbot_command))

@@ -487,7 +487,7 @@ def get_bypass_code(type_code):
                 'pattern': 'layma_me_vuatraffic'
             },
             'v9bet': {
-                'url': 'https://traffic-user.net/GET_MA.php?codexn=taodeptrai&url=https://v9betho.com/ca-cuoc-bong-ro-ao&loai_traffic=https://v9betho.com/&clk=1000',
+                'url': 'https://traffic-user.net/GET_MA.php?codexn=taodeptrai&url=https://v9betlg.com/ca-cuoc-bong-ro-ao&loai_traffic=https://v9betlg.com/&clk=1000',
                 'pattern': 'layma_me_vuatraffic'
             },
             'vn88': {

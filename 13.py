@@ -8,8 +8,18 @@ import asyncio
 import random
 import string
 import logging
+import datetime
+from datetime import datetime as dt, timedelta
 
-from flask import Flask, request, jsonify, render_template_string
+# Import Flask an toàn
+try:
+    from flask import Flask, request, jsonify, render_template_string
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Flask không có sẵn - Web API sẽ bị vô hiệu hóa")
+
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -24,6 +34,16 @@ KEY_CLEANUP_INTERVAL = 300  # Dọn dẹp KEY hết hạn mỗi 5 phút
 KEY_MAX_PER_USER = 1  # Mỗi user chỉ được có 1 KEY active
 KEY_COOLDOWN_TIME = 3600  # Cooldown tạo KEY mới: 1 giờ
 MASTER_ADMIN_ID = 7509896689
+
+# ========== BOT CONTROL SYSTEM ==========
+BOT_STATUS_FILE = os.path.join("data", "bot_status.json")
+SCHEDULED_TASKS_FILE = os.path.join("data", "scheduled_tasks.json")
+
+# Biến điều khiển trạng thái bot
+BOT_ACTIVE = True
+BOT_STATUS_LOCK = threading.Lock()
+SCHEDULED_TASKS = {}  # task_id -> task_info
+TASK_COUNTER = 0
 
 BYPASS_TYPES = [
     "m88", "fb88", "188bet", "w88", "v9bet", "bk8",
@@ -46,6 +66,8 @@ KEY_METADATA_FILE = os.path.join(DATA_DIR, "key_metadata.json")  # Metadata chi 
 KEY_USAGE_LOG_FILE = os.path.join(DATA_DIR, "key_usage_log.json")  # Log sử dụng KEY
 ADMINS_FILE = os.path.join(DATA_DIR, "admins.json")
 BAN_LIST_FILE = os.path.join(DATA_DIR, "ban_list.json")
+BOT_STATUS_FILE = os.path.join(DATA_DIR, "bot_status.json")
+SCHEDULED_TASKS_FILE = os.path.join(DATA_DIR, "scheduled_tasks.json")
 
 # ========== BIẾN TOÀN CỤC ==========
 VALID_KEYS = {}    # key -> (timestamp tạo, thời gian sống giây)
@@ -61,8 +83,14 @@ BAN_LIST = {}
 USER_LOCKS = threading.Lock()
 DATA_LOCK = threading.Lock()  # Lock để đồng bộ khi lưu/đọc dữ liệu
 
+# ========== GLOBAL APPLICATION CONTEXT ==========
+APPLICATION = None  # Sẽ được set trong main()
+
 # ========== FLASK APP ==========
-app = Flask(__name__)
+if FLASK_AVAILABLE:
+    app = Flask(__name__)
+else:
+    app = None
 
 # ========== HƯỚNG DẪN ADMIN ==========
 ADMIN_GUIDE = (
@@ -95,17 +123,30 @@ ADMIN_GUIDE = (
     "│ <code>/logs</code>                  │ 📝 Xem logs hệ thống\n"
     "│ <code>/restart</code>               │ 🔄 Khởi động lại bot\n"
     "└─────────────────────────────────┘\n\n"
+    "🎛️ <b>ĐIỀU KHIỂN BOT</b> <i>(Chỉ Master Admin)</i>\n"
+    "┌─────────────────────────────────┐\n"
+    "│ <code>/batbot</code>                │ 🟢 Bật bot\n"
+    "│ <code>/tatbot</code>                │ 🔴 Tắt bot\n"
+    "│ <code>/hentacbot &lt;thời_gian&gt;</code> │ ⏰ Hẹn tắt bot\n"
+    "│ <code>/henbatbot &lt;thời_gian&gt;</code> │ ⏰ Hẹn bật bot\n"
+    "│ <code>/danhsachlichhen</code>       │ 📋 Xem lịch hẹn\n"
+    "│ <code>/huylichhen &lt;mã&gt;</code>      │ ❌ Hủy lịch hẹn\n"
+    "│ <code>/thongbao &lt;tin_nhắn&gt;</code>  │ 📢 Gửi thông báo chung\n"
+    "└─────────────────────────────────┘\n\n"
     "⚠️ <b>LƯU Ý QUAN TRỌNG</b>\n"
     "▫️ Mỗi KEY = 1 thiết bị duy nhất\n"
     "▫️ KEY có thể dùng nhiều lần trong thời hạn\n"
     "▫️ Ban thủ công ghi đè ban tự động\n"
     "▫️ Backup dữ liệu định kỳ 5 phút/lần\n"
-    "▫️ <b>deleteallkeys chỉ Master Admin (ID: 7509896689)</b>\n\n"
+    "▫️ <b>deleteallkeys chỉ Master Admin (ID: 7509896689)</b>\n"
+    "▫️ <b>Bot control chỉ Master Admin (ID: 7509896689)</b>\n\n"
     "📝 <b>VÍ DỤ SỬ DỤNG</b>\n"
     "<code>/ban 123456789 30</code> - Ban user 30 phút\n"
     "<code>/taokey 7</code> - Tạo KEY VIP 7 ngày\n"
     "<code>/deletekey VIP2025-ABC123</code> - Xóa KEY cụ thể\n"
-    "<code>/broadcast Bảo trì hệ thống 10 phút</code>\n"
+    "<code>/hentacbot 30</code> - Hẹn tắt bot sau 30 phút\n"
+    "<code>/henbatbot 08:00</code> - Hẹn bật bot lúc 8:00 sáng\n"
+    "<code>/thongbao Bảo trì hệ thống 10 phút</code> - Gửi thông báo\n"
     "═══════════════════════════════════"
 )
 
@@ -253,6 +294,270 @@ def load_ban_list():
                             BAN_LIST[int(user_id_str)] = ban_info
             except Exception as e:
                 logger.error(f"Lỗi khi đọc file BAN_LIST_FILE: {e}")
+
+# ========== BOT CONTROL FUNCTIONS ==========
+
+def save_bot_status():
+    """Lưu trạng thái bot"""
+    with BOT_STATUS_LOCK:
+        data = {
+            'active': BOT_ACTIVE,
+            'last_updated': time.time()
+        }
+        with open(BOT_STATUS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+
+def load_bot_status():
+    """Đọc trạng thái bot"""
+    global BOT_ACTIVE
+    with BOT_STATUS_LOCK:
+        if os.path.exists(BOT_STATUS_FILE):
+            try:
+                with open(BOT_STATUS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    BOT_ACTIVE = data.get('active', True)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc file BOT_STATUS_FILE: {e}")
+                BOT_ACTIVE = True
+
+def save_scheduled_tasks():
+    """Lưu các task đã lên lịch"""
+    with DATA_LOCK:
+        # Chỉ lưu thông tin cơ bản, không lưu thread object
+        data = {}
+        for task_id, task_info in SCHEDULED_TASKS.items():
+            data[task_id] = {
+                'action': task_info['action'],
+                'scheduled_time': task_info['scheduled_time'],
+                'creator_id': task_info['creator_id'],
+                'created_at': task_info['created_at'],
+                'status': task_info.get('status', 'pending')
+            }
+        with open(SCHEDULED_TASKS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+
+def load_scheduled_tasks():
+    """Đọc các task đã lên lịch"""
+    global SCHEDULED_TASKS
+    with DATA_LOCK:
+        if os.path.exists(SCHEDULED_TASKS_FILE):
+            try:
+                with open(SCHEDULED_TASKS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    current_time = time.time()
+                    # Chỉ load những task chưa hết hạn
+                    for task_id, task_info in data.items():
+                        if task_info['scheduled_time'] > current_time:
+                            SCHEDULED_TASKS[task_id] = task_info
+                            # Không tái tạo timer, sẽ tạo lại khi restart
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc file SCHEDULED_TASKS_FILE: {e}")
+
+def is_bot_active():
+    """Kiểm tra bot có đang hoạt động không"""
+    return BOT_ACTIVE
+
+def toggle_bot_status(active, admin_id=None):
+    """Bật/tắt bot"""
+    global BOT_ACTIVE
+    with BOT_STATUS_LOCK:
+        BOT_ACTIVE = active
+        save_bot_status()
+        
+    action = "BẬT" if active else "TẮT"
+    admin_info = f" bởi Admin {admin_id}" if admin_id else ""
+    logger.info(f"Bot đã được {action}{admin_info}")
+    
+    return active
+
+def schedule_bot_toggle(action, scheduled_time, creator_id):
+    """Lên lịch bật/tắt bot"""
+    global TASK_COUNTER
+    TASK_COUNTER += 1
+    task_id = f"toggle_{TASK_COUNTER}_{int(time.time())}"
+    
+    task_info = {
+        'action': action,  # 'on' hoặc 'off'
+        'scheduled_time': scheduled_time,
+        'creator_id': creator_id,
+        'created_at': time.time(),
+        'status': 'pending'
+    }
+    
+    SCHEDULED_TASKS[task_id] = task_info
+    save_scheduled_tasks()
+    
+    # Tạo timer để thực hiện task
+    delay = scheduled_time - time.time()
+    if delay > 0:
+        timer = threading.Timer(delay, execute_scheduled_task, [task_id])
+        task_info['timer'] = timer
+        timer.start()
+        
+    return task_id
+
+def execute_scheduled_task(task_id):
+    """Thực hiện task đã lên lịch"""
+    if task_id not in SCHEDULED_TASKS:
+        return
+        
+    task_info = SCHEDULED_TASKS[task_id]
+    action = task_info['action']
+    
+    if action == 'on':
+        toggle_bot_status(True, task_info['creator_id'])
+        broadcast_message(f"🔔 <b>THÔNG BÁO HỆ THỐNG</b>\n\n✅ Bot đã được <b>BẬT</b> tự động theo lịch hẹn.\n\n⏰ Thời gian: {dt.now().strftime('%H:%M:%S %d/%m/%Y')}")
+    elif action == 'off':
+        toggle_bot_status(False, task_info['creator_id'])
+        broadcast_message(f"🔔 <b>THÔNG BÁO HỆ THỐNG</b>\n\n⏸️ Bot đã được <b>TẮT</b> tự động theo lịch hẹn.\n\n⏰ Thời gian: {dt.now().strftime('%H:%M:%S %d/%m/%Y')}")
+    
+    # Cập nhật trạng thái task
+    task_info['status'] = 'completed'
+    save_scheduled_tasks()
+    
+    # Xóa task khỏi bộ nhớ
+    del SCHEDULED_TASKS[task_id]
+
+def cancel_scheduled_task(task_id):
+    """Hủy task đã lên lịch"""
+    if task_id not in SCHEDULED_TASKS:
+        return False
+        
+    task_info = SCHEDULED_TASKS[task_id]
+    
+    # Hủy timer nếu có
+    if 'timer' in task_info:
+        task_info['timer'].cancel()
+    
+    # Xóa task
+    del SCHEDULED_TASKS[task_id]
+    save_scheduled_tasks()
+    
+    return True
+
+def get_scheduled_tasks():
+    """Lấy danh sách tasks đã lên lịch"""
+    return SCHEDULED_TASKS.copy()
+
+def restart_scheduled_tasks():
+    """Khởi động lại các scheduled tasks sau khi restart bot"""
+    current_time = time.time()
+    restarted_count = 0
+    
+    for task_id, task_info in SCHEDULED_TASKS.copy().items():
+        scheduled_time = task_info['scheduled_time']
+        
+        # Xóa task đã hết hạn
+        if scheduled_time <= current_time:
+            del SCHEDULED_TASKS[task_id]
+            continue
+            
+        # Tái tạo timer cho task còn hiệu lực
+        delay = scheduled_time - current_time
+        timer = threading.Timer(delay, execute_scheduled_task, [task_id])
+        task_info['timer'] = timer
+        timer.start()
+        restarted_count += 1
+    
+    save_scheduled_tasks()
+    logger.info(f"✅ Đã restart {restarted_count} scheduled tasks")
+
+def broadcast_message(message):
+    """Gửi tin nhắn tới tất cả users"""
+    global APPLICATION
+    if APPLICATION is None:
+        logger.warning(f"BROADCAST FAILED - No application context: {message}")
+        return
+    
+    # Tạo task async để gửi broadcast
+    import asyncio
+    try:
+        # Tạo event loop mới nếu không có
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(send_broadcast_async(APPLICATION, message))
+        loop.close()
+    except Exception as e:
+        logger.error(f"Lỗi khi gửi broadcast: {e}")
+        # Fallback: chỉ log message
+        logger.info(f"BROADCAST: {message}")
+
+async def send_broadcast_async(application, message):
+    """Gửi tin nhắn broadcast async"""
+    # Gửi tới tất cả users có KEY
+    sent_count = 0
+    failed_count = 0
+    
+    for user_id in USER_KEYS.keys():
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode='HTML'
+            )
+            sent_count += 1
+            await asyncio.sleep(0.1)  # Tránh spam
+        except Exception as e:
+            failed_count += 1
+            logger.error(f"Lỗi gửi broadcast tới {user_id}: {e}")
+    
+    # Gửi tới tất cả admins
+    for admin_id in ADMINS:
+        if admin_id not in USER_KEYS:  # Tránh gửi trùng
+            try:
+                await application.bot.send_message(
+                    chat_id=admin_id,
+                    text=message,
+                    parse_mode='HTML'
+                )
+                sent_count += 1
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Lỗi gửi broadcast tới admin {admin_id}: {e}")
+    
+    logger.info(f"Broadcast hoàn thành: {sent_count} thành công, {failed_count} thất bại")
+
+# ========== BOT STATUS DECORATOR ==========
+
+def check_bot_active(admin_only_commands=None):
+    """Decorator kiểm tra trạng thái bot"""
+    if admin_only_commands is None:
+        admin_only_commands = ['batbot', 'tatbot', 'hentacbot', 'henbatbot', 'danhsachlichhen', 'huylichhen', 'thongbao']
+    
+    def decorator(func):
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user_id = update.effective_user.id
+            command = update.message.text.split()[0][1:]  # Bỏ dấu /
+            
+            # Nếu bot bị tắt và không phải lệnh admin điều khiển bot
+            if not is_bot_active() and command not in admin_only_commands:
+                if user_id == MASTER_ADMIN_ID:
+                    await update.message.reply_html(
+                        "⚠️ <b>BOT ĐANG TẮT</b>\n\n"
+                        "Bot hiện đang trong trạng thái tắt.\n"
+                        "Sử dụng <code>/batbot</code> để bật lại."
+                    )
+                else:
+                    await update.message.reply_html(
+                        "🛑 <b>BOT TẠM NGỪNG HOẠT ĐỘNG</b>\n\n"
+                        "Bot hiện đang bảo trì hoặc tạm ngừng dịch vụ.\n"
+                        "Vui lòng thử lại sau!\n\n"
+                        "📞 Liên hệ admin nếu cần hỗ trợ khẩn cấp."
+                    )
+                return
+            
+            # Nếu là lệnh admin mà user không phải admin
+            if command in admin_only_commands and user_id != MASTER_ADMIN_ID:
+                await update.message.reply_html(
+                    "🚫 <b>QUYỀN TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
+                    "Chỉ Master Admin mới có quyền sử dụng lệnh này."
+                )
+                return
+                
+            return await func(update, context)
+        return wrapper
+    return decorator
 
 # ========== KEY MANAGEMENT PROFESSIONAL SYSTEM ==========
 
@@ -443,6 +748,10 @@ def save_all_data():
     save_key_devices()
     save_admins()
     save_ban_list()
+    save_bot_status()
+    save_scheduled_tasks()
+    save_key_metadata()
+    save_key_usage_log()
     logger.info(f"Đã lưu dữ liệu thành công!")
 
 def load_all_data():
@@ -451,6 +760,10 @@ def load_all_data():
     load_key_devices()
     load_admins()
     load_ban_list()
+    load_bot_status()
+    load_scheduled_tasks()
+    load_key_metadata()
+    load_key_usage_log()
     logger.info(f"Đã tải dữ liệu thành công!")
 
 # Luồng tự động lưu dữ liệu định kỳ
@@ -947,93 +1260,101 @@ def handle_admin_command(current_user_id, cmd, args):
         return {"status": "error", "msg": admin_notify(f"Lỗi hệ thống: {e}")}
 
 # ========== CÁC LỆNH BOT ==========
+@check_bot_active()
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "User"
     first_name = update.effective_user.first_name or "Bạn"
     
-    # Emoji animation và welcome message
+    # Emoji animation và welcome message - BÓNG X PREMIUM EDITION
     text = (
-        f"🚀 <b>YEUMONEY BYPASS PRO</b> 🚀\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌟 <i>Hệ thống lấy mã bypass thế hệ mới</i> 🌟\n\n"
+        f"⚡ <b>BÓNG X BYPASS PREMIUM</b> ⚡\n"
+        f"╔═══════════════════════════════════════╗\n"
+        f"║  🌟  <i>CÔNG NGHỆ THÔNG MINH THÀNH CÔNG</i>  🌟  ║\n"
+        f"╚═══════════════════════════════════════╝\n\n"
         
-        f"👋 <b>XIN CHÀO {first_name.upper()}!</b>\n"
-        f"╭─────────────────────────────────╮\n"
-        f"│  � <b>PREMIUM</b> • ⚡ <b>MIỄN PHÍ</b> • 🛡️ <b>BẢO MẬT</b>  │\n"
-        f"╰─────────────────────────────────╯\n\n"
+        f"👋 <b>CHÀO MỪNG {first_name.upper()} ĐẾN VỚI BÓNG X!</b>\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃   🎯 <b>PREMIUM</b> • ⚡ <b>SIÊU TỐC</b> • 🛡️ <b>AN TOÀN</b>   ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
         
-        f"👤 <b>THÔNG TIN TÀI KHOẢN</b>\n"
-        f"╔═════════════════════════════════╗\n"
+        f"🎖️ <b>THÔNG TIN VIP MEMBER</b>\n"
+        f"╔═══════════════════════════════════════╗\n"
         f"║ 🆔 ID: <code>{user_id}</code>\n"
         f"║ 👤 Username: @{username if username else 'Chưa đặt'}\n"
         f"║ 🎭 Tên: <b>{first_name}</b>\n"
-        f"║ 🏆 Cấp độ: <b>{'👑 Admin VIP' if is_admin(user_id) else '👤 User'}</b>\n"
+        f"║ 🏆 Cấp độ: <b>{'👑 BÓNG X ADMIN' if is_admin(user_id) else '💎 BÓNG X MEMBER'}</b>\n"
         f"╚═════════════════════════════════╝\n\n"
         
-        f"� <b>MENU ĐIỀU KHIỂN</b>\n"
-        f"╭─────────────────────────────────╮\n"
-        f"│ <code>/key</code>                    │ 🔑 Tạo KEY miễn phí\n"
-        f"│ <code>/xacnhankey &lt;KEY&gt;</code>      │ ✅ Kích hoạt KEY\n"
-        f"│ <code>/checkkey</code>               │ 🔍 Kiểm tra KEY\n"
-        f"│ <code>/ym &lt;loại&gt;</code>            │ 🎯 Lấy mã bypass\n"
-        f"│ <code>/help</code>                   │ ❓ Hướng dẫn chi tiết\n"
-        f"│ <code>/profile</code>                │ 👤 Thông tin cá nhân\n"
-        f"╰─────────────────────────────────╯\n\n"
+        f"🎮 <b>BÓNG X CONTROL CENTER</b>\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃ <code>/key</code>                    ┃ 🔑 Tạo KEY miễn phí\n"
+        f"┃ <code>/xacnhankey &lt;KEY&gt;</code>      ┃ ✅ Kích hoạt KEY\n"
+        f"┃ <code>/checkkey</code>               ┃ 🔍 Kiểm tra KEY\n"
+        f"┃ <code>/ym &lt;loại&gt;</code>            ┃ 🎯 Lấy mã bypass\n"
+        f"┃ <code>/help</code>                   ┃ ❓ Hướng dẫn chi tiết\n"
+        f"┃ <code>/profile</code>                ┃ 👤 Thông tin cá nhân\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
         
-        f"� <b>CÁC LOẠI MÃ HỖ TRỢ</b>\n"
-        f"╔═════════════════════════════════╗\n"
+        f"🏅 <b>BÓNG X PREMIUM BYPASS</b>\n"
+        f"╔═══════════════════════════════════════╗\n"
     )
     
     # Hiển thị các loại mã theo nhóm
     bypass_groups = {
-        "🎰 Casino Premium": ["m88", "fb88", "w88", "88betag"],
-        "🏆 Betting Elite": ["188bet", "v9bet", "bk8", "w88abc"],
-        "🎲 Gaming VIP": ["v9betlg", "bk8xo", "vn88ie", "w88xlm"]
+        "🎰 Bóng X Casino": ["m88", "fb88", "w88", "88betag"],
+        "🏆 Bóng X Elite": ["188bet", "v9bet", "bk8", "w88abc"],
+        "🎲 Bóng X VIP": ["v9betlg", "bk8xo", "vn88ie", "w88xlm"]
     }
     
     for group_name, types in bypass_groups.items():
         text += f"║ {group_name}: {', '.join([f'<code>{t}</code>' for t in types])}\n"
     
-    text += f"╚═════════════════════════════════╝\n\n"
+    text += f"╚═══════════════════════════════════════╝\n\n"
     
     if is_admin(user_id):
         text += (
-            f"👑 <b>ADMIN CONTROL PANEL</b>\n"
-            f"╔═════════════════════════════════╗\n"
-            f"║ <code>/adminguide</code>             │ 📖 Hướng dẫn admin\n"
-            f"║ <code>/taokey &lt;ngày&gt;</code>         │ 🎁 Tạo KEY VIP\n"
-            f"║ <code>/listkey</code>                │ 📋 Danh sách KEY\n"
-            f"║ <code>/ban &lt;id&gt; &lt;phút&gt;</code>       │ 🚫 Ban user\n"
-            f"║ <code>/stats</code>                  │ 📊 Thống kê hệ thống\n"
-            f"╚═════════════════════════════════╝\n\n"
+            f"👑 <b>BÓNG X ADMIN CENTER</b>\n"
+            f"╔═══════════════════════════════════════╗\n"
+            f"║ <code>/adminguide</code>             ║ 📖 Hướng dẫn admin\n"
+            f"║ <code>/taokey &lt;ngày&gt;</code>         ║ 🎁 Tạo KEY VIP\n"
+            f"║ <code>/listkey</code>                ║ 📋 Danh sách KEY\n"
+            f"║ <code>/ban &lt;id&gt; &lt;phút&gt;</code>       ║ 🚫 Ban user\n"
+            f"║ <code>/stats</code>                  ║ 📊 Thống kê hệ thống\n"
+            f"║ <code>/batbot</code>                 ║ 🟢 Bật bot\n"
+            f"║ <code>/tatbot</code>                 ║ 🔴 Tắt bot\n"
+            f"║ <code>/thongbao &lt;tin&gt;</code>        ║ 📢 Thông báo\n"
+            f"╚═══════════════════════════════════════╝\n\n"
         )
     
     text += (
-        f"⚡ <b>TÍNH NĂNG NỔI BẬT</b>\n"
-        f"╭─────────────────────────────────╮\n"
-        f"│ ✨ Lấy mã tự động 24/7          │\n"
-        f"│ � Bảo mật KEY cá nhân          │\n"
-        f"│ 🚀 Tốc độ xử lý siêu nhanh      │\n"
-        f"│ 🛡️ Chống spam thông minh        │\n"
-        f"│ 📱 Hỗ trợ mọi thiết bị          │\n"
-        f"│ 💎 Hoàn toàn miễn phí           │\n"
-        f"╰─────────────────────────────────╯\n\n"
+        f"⭐ <b>BÓNG X PREMIUM FEATURES</b>\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃ ✨ Lấy mã tự động 24/7          ┃\n"
+        f"┃ 🔐 Bảo mật KEY cá nhân          ┃\n"
+        f"┃ 🚀 Tốc độ xử lý siêu nhanh      ┃\n"
+        f"┃ 🛡️ Chống spam thông minh        ┃\n"
+        f"┃ 📱 Hỗ trợ mọi thiết bị          ┃\n"
+        f"┃ 💎 Hoàn toàn miễn phí           ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
         
-        f"🎯 <b>HƯỚNG DẪN SỬ DỤNG</b>\n"
-        f"╔═════════════════════════════════╗\n"
+        f"🎯 <b>HƯỚNG DẪN BÓNG X</b>\n"
+        f"╔═══════════════════════════════════════╗\n"
         f"║ 1️⃣ Gõ <code>/key</code> để tạo KEY miễn phí  ║\n"
         f"║ 2️⃣ Copy KEY và dùng <code>/xacnhankey</code>  ║\n"
         f"║ 3️⃣ Sử dụng <code>/ym m88</code> để lấy mã    ║\n"
         f"║ 4️⃣ Chờ 75 giây và nhận mã!      ║\n"
-        f"╚═════════════════════════════════╝\n\n"
+        f"╚═══════════════════════════════════════╝\n\n"
         
-        f"� <b>CHÚC BẠN SỬ DỤNG THÀNH CÔNG!</b> �\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"🌟 <b>CHÚC BẠN SỬ DỤNG BÓNG X THÀNH CÔNG!</b> 🌟\n"
+        f"╔═══════════════════════════════════════╗\n"
+        f"║          💎 BÓNG X PREMIUM 💎         ║\n"
+        f"╚═══════════════════════════════════════╝"
     )
     
     await update.message.reply_html(text)
 
+@check_bot_active()
 async def key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "User"
@@ -1143,7 +1464,7 @@ async def key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏰ <b>Thông tin KEY:</b>\n"
             f"┌─────────────────────────────────┐\n"
             f"│ ⏳ Hiệu lực: <b>24 giờ</b>\n"
-            f"│ � Thiết bị: <b>Chỉ 1 thiết bị</b>\n"
+            f"│ 🔐 Thiết bị: <b>Chỉ 1 thiết bị</b>\n"
             f"│ 🔄 Sử dụng: <b>Không giới hạn</b>\n"
             f"│ 🎯 Loại: <b>Admin Premium</b>\n"
             f"└─────────────────────────────────┘\n\n"
@@ -1250,6 +1571,7 @@ async def key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
+@check_bot_active()
 async def taokey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -1295,6 +1617,7 @@ async def taokey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await send_admin_notify_key(context, notify_msg)
 
+@check_bot_active()
 async def xacnhankey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "User"
@@ -1380,7 +1703,7 @@ async def xacnhankey_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"┌─────────────────────────────────┐\n"
             f"│ 🔑 KEY: <code>{key}</code>\n"
             f"│ ⏰ Còn lại: <b>{key_info['time_remaining']}</b>\n"
-            f"│ � Chủ sở hữu: <b>@{username}</b>\n"
+            f"│ 🔐 Chủ sở hữu: <b>@{username}</b>\n"
             f"│ 📱 Thiết bị: <b>Riêng tư</b>\n"
             f"│ 🔄 Sử dụng: <b>Không giới hạn</b>\n"
             f"└─────────────────────────────────┘\n\n"
@@ -1405,8 +1728,8 @@ async def xacnhankey_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"┌─────────────────────────────────┐\n"
             f"│ ⏰ Còn lại: <b>{key_info['time_remaining']}</b>\n"
             f"│ 👤 Chủ sở hữu: <b>@{username}</b>\n"
-            f"│ � Thiết bị: <b>Riêng tư</b>\n"
-            f"│ �🔄 Sử dụng: <b>Không giới hạn</b>\n"
+            f"│ 🔐 Thiết bị: <b>Riêng tư</b>\n"
+            f"│ 🔄 Sử dụng: <b>Không giới hạn</b>\n"
             f"└─────────────────────────────────┘\n\n"
             f"❌ <b>KHÔNG THỂ KÍCH HOẠT KEY MỚI</b>\n"
             f"💡 <b>Lý do:</b> Mỗi tài khoản chỉ có 1 KEY active\n\n"
@@ -1454,6 +1777,7 @@ async def xacnhankey_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="HTML"
         )
 
+@check_bot_active()
 async def checkkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "User"
@@ -1519,7 +1843,7 @@ async def checkkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"═══════════════════════════════════\n\n"
         f"👤 <b>THÔNG TIN CHỦ SỞ HỮU:</b>\n"
         f"┌─────────────────────────────────┐\n"
-        f"│ � Username: <b>@{username}</b>\n"
+        f"│ 🔐 Username: <b>@{username}</b>\n"
         f"│ 🆔 User ID: <code>{user_id}</code>\n"
         f"│ 🎯 Cấp độ: <b>{'👑 Admin' if is_admin(user_id) else '👤 User'}</b>\n"
         f"└─────────────────────────────────┘\n\n"
@@ -1529,7 +1853,7 @@ async def checkkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"│ 🔐 KEY: <code>{key}</code>\n"
         f"│ ⏰ Còn lại: <b>{key_info['time_remaining']}</b>\n"
         f"│ 📱 Thiết bị: <b>{bound_status}</b>\n"
-        f"│ � Sử dụng: <b>Không giới hạn</b>\n"
+        f"│ 🔐 Sử dụng: <b>Không giới hạn</b>\n"
         f"│ ✅ Trạng thái: <b>Đang hoạt động</b>\n"
         f"└─────────────────────────────────┘\n\n"
         
@@ -1553,6 +1877,7 @@ async def checkkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_html(msg)
 
+@check_bot_active()
 async def ym_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "User"
@@ -1654,7 +1979,7 @@ async def ym_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     type_emoji = type_emojis.get(type_code, "🎯")
     
     sent = await update.message.reply_html(
-        f"🚀 <b>YEUMONEY BYPASS SYSTEM</b> 🚀\n"
+        f"⚡ <b>BÓNG X BYPASS SYSTEM</b> ⚡\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🌟 <i>Đang khởi tạo quy trình lấy mã...</i> 🌟\n\n"
         
@@ -1680,7 +2005,7 @@ async def ym_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try:
                 await sent.edit_text(
-                    f"🚀 <b>YEUMONEY BYPASS PRO</b> 🚀\n"
+                    f"🚀 <b>BÓNG X PREMIUM</b> 🚀\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"⚡ <i>Đang xử lý lấy mã {type_code.upper()}</i> ⚡\n\n"
                     
@@ -1725,7 +2050,7 @@ async def ym_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if code:
                 await sent.edit_text(
-                    f"🎉 <b>YEUMONEY BYPASS PRO</b> 🎉\n"
+                    f"🎉 <b>BÓNG X PREMIUM</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🌟 <i>Lấy mã thành công!</i> 🌟\n\n"
                     
@@ -1761,7 +2086,7 @@ async def ym_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await sent.edit_text(
-                    f"❌ <b>YEUMONEY BYPASS PRO</b> ❌\n"
+                    f"❌ <b>BÓNG X PREMIUM</b> ❌\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"⚠️ <i>Không thể lấy mã tại thời điểm này</i> ⚠️\n\n"
                     
@@ -1822,6 +2147,7 @@ async def ym_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(countdown_and_get_code())
 
 # Lệnh lưu dữ liệu thủ công
+@check_bot_active()
 async def savedata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -1835,12 +2161,13 @@ async def savedata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(f"❌ <b>Lỗi khi lưu dữ liệu:</b> <code>{str(e)}</code>")
 
 # Lệnh trợ giúp chi tiết
+@check_bot_active()
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "User"
     
     help_text = (
-        f"📚 <b>HƯỚNG DẪN CHI TIẾT - YEUMONEY PRO</b>\n"
+        f"📚 <b>HƯỚNG DẪN CHI TIẾT - BÓNG X PREMIUM</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🌟 <i>Hệ thống bypass chuyên nghiệp</i> 🌟\n\n"
         
@@ -1892,7 +2219,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"╭─────────────────────────────────╮\n"
         f"│ ✨ Lấy mã không giới hạn         │\n"
         f"│ ⚡ Thời gian chờ chỉ 75 giây     │\n"
-        f"│ � Bảo mật KEY cá nhân          │\n"
+        f"│ 🔐 Bảo mật KEY cá nhân          │\n"
         f"│ 📱 Hoạt động 1 thiết bị         │\n"
         f"│ 🔄 Tạo KEY mới miễn phí         │\n"
         f"╰─────────────────────────────────╯\n\n"
@@ -1912,6 +2239,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(help_text)
 
 # Lệnh xem profile
+@check_bot_active()
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "Chưa đặt"
@@ -1925,51 +2253,53 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     join_date = "Hôm nay"  # Có thể lưu thực tế trong database
     
     # Level dựa trên admin status
-    user_level = "👑 Administrator" if is_admin(user_id) else "👤 User"
-    level_emoji = "👑" if is_admin(user_id) else "⭐"
+    user_level = "👑 Bóng X Administrator" if is_admin(user_id) else "� Bóng X Member"
+    level_emoji = "👑" if is_admin(user_id) else "💎"
     
     profile_text = (
-        f"👤 <b>THÔNG TIN TÀI KHOẢN</b>\n"
-        f"═══════════════════════════════════\n\n"
-        f"📋 <b>THÔNG TIN CÁ NHÂN:</b>\n"
-        f"┌─────────────────────────────────┐\n"
-        f"│ 🎭 Tên: <b>{first_name}</b>\n"
-        f"│ 👤 Username: <b>@{username}</b>\n"
-        f"│ 🆔 User ID: <code>{user_id}</code>\n"
-        f"│ {level_emoji} Cấp độ: <b>{user_level}</b>\n"
-        f"│ 📅 Tham gia: <b>{join_date}</b>\n"
-        f"└─────────────────────────────────┘\n\n"
+        f"🎖️ <b>BÓNG X PREMIUM PROFILE</b>\n"
+        f"╔═══════════════════════════════════════╗\n"
+        f"║          💎 BÓNG X PREMIUM 💎         ║\n"
+        f"╚═══════════════════════════════════════╝\n\n"
+        f"📋 <b>THÔNG TIN VIP MEMBER:</b>\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃ 🎭 Tên: <b>{first_name}</b>\n"
+        f"┃ 👤 Username: <b>@{username}</b>\n"
+        f"┃ 🆔 User ID: <code>{user_id}</code>\n"
+        f"┃ {level_emoji} Cấp độ: <b>{user_level}</b>\n"
+        f"┃ 📅 Tham gia: <b>{join_date}</b>\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
         
-        f"🔑 <b>TRẠNG THÁI KEY:</b>\n"
-        f"┌─────────────────────────────────┐\n"
-        f"│ 📊 Trạng thái: {key_status}\n"
+        f"🔑 <b>BÓNG X KEY STATUS:</b>\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃ 📊 Trạng thái: {key_status}\n"
     )
     
     if user_key and check_key(user_key):
         key_info = get_key_info(user_key)
         profile_text += (
-            f"│ 🔐 KEY: <code>{user_key}</code>\n"
-            f"│ ⏰ Còn lại: <b>{key_info['time_remaining']}</b>\n"
-            f"│ 📱 Thiết bị: <b>Đã gắn</b>\n"
+            f"┃ 🔐 KEY: <code>{user_key}</code>\n"
+            f"┃ ⏰ Còn lại: <b>{key_info['time_remaining']}</b>\n"
+            f"┃ 📱 Thiết bị: <b>Đã gắn</b>\n"
         )
     else:
         profile_text += (
-            f"│ 🔐 KEY: <b>Chưa có</b>\n"
-            f"│ ⏰ Thời hạn: <b>N/A</b>\n"
-            f"│ 📱 Thiết bị: <b>Chưa gắn</b>\n"
+            f"┃ 🔐 KEY: <b>Chưa có</b>\n"
+            f"┃ ⏰ Thời hạn: <b>N/A</b>\n"
+            f"┃ 📱 Thiết bị: <b>Chưa gắn</b>\n"
         )
     
     profile_text += (
-        f"└─────────────────────────────────┘\n\n"
-        f"📊 <b>THỐNG KÊ SỬ DỤNG:</b>\n"
-        f"┌─────────────────────────────────┐\n"
-        f"│ 🎯 Loại mã hỗ trợ: <b>{len(BYPASS_TYPES)} loại</b>\n"
-        f"│ 🚀 Trạng thái bot: <b>Hoạt động</b>\n"
-        f"│ 🛡️ Bảo mật: <b>Cao</b>\n"
-        f"│ ⚡ Tốc độ: <b>75 giây/mã</b>\n"
-        f"└─────────────────────────────────┘\n\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        f"📊 <b>BÓNG X PREMIUM STATS:</b>\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃ 🎯 Loại mã hỗ trợ: <b>{len(BYPASS_TYPES)} loại</b>\n"
+        f"┃ 🚀 Trạng thái bot: <b>Hoạt động</b>\n"
+        f"┃ 🛡️ Bảo mật: <b>Premium Level</b>\n"
+        f"┃ ⚡ Tốc độ: <b>75 giây/mã</b>\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
         
-        f"🎯 <b>HÀNH ĐỘNG NHANH:</b>\n"
+        f"🎯 <b>BÓNG X QUICK ACTIONS:</b>\n"
     )
     
     if not user_key or not check_key(user_key):
@@ -1986,12 +2316,16 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile_text += (
         f"📚 <code>/help</code> - Hướng dẫn chi tiết\n"
         f"🏠 <code>/start</code> - Màn hình chính\n\n"
-        f"💎 <b>Cảm ơn bạn đã sử dụng bot!</b>"
+        f"🌟 <b>Cảm ơn bạn đã chọn Bóng X Premium!</b> 🌟\n"
+        f"╔═══════════════════════════════════════╗\n"
+        f"║         💎 BÓNG X PREMIUM 💎          ║\n"
+        f"╚═══════════════════════════════════════╝"
     )
     
     await update.message.reply_html(profile_text)
 
 # Lệnh thống kê cho admin
+@check_bot_active()
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -2048,6 +2382,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(stats_text)
 
 # LỆNH /listkey: DANH SÁCH USER ĐANG SỬ DỤNG KEY
+@check_bot_active()
 async def listkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -2077,6 +2412,7 @@ async def listkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(msg)
 
 # ========== LỆNH XÓA KEY (ADMIN) ==========
+@check_bot_active()
 async def deletekey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -2184,6 +2520,7 @@ async def deletekey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Lỗi khi xóa KEY {key_to_delete}: {e}")
 
 # ========== LỆNH XÓA TẤT CẢ KEY (MASTER ADMIN ONLY) ==========
+@check_bot_active()
 async def deleteallkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
@@ -2288,68 +2625,101 @@ async def deleteallkeys_command(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"LỖI NGHIÊM TRỌNG khi Master Admin {user_id} xóa tất cả KEY: {e}")
 
 # ========== FLASK ROUTES (API) ==========
-@app.route('/bypass', methods=['POST'])
-def k():
-    try:
-        json_data = request.get_json()
-        if not json_data:
-            return jsonify({'error': 'Không có dữ liệu'}), 400
-        type_code = json_data.get('type')
-        user_id = json_data.get('user_id')
-        key = json_data.get('key') or None
-        
-        # Nếu không có key từ request, lấy key từ user
-        if key is None and user_id is not None:
-            key = USER_KEYS.get(user_id)
-        
-        if not type_code:
-            return jsonify({'error': 'Thiếu trường type'}), 400
-        if not key or not check_key(key):
-            return jsonify({'error': 'Bạn phải xác nhận KEY hợp lệ trước khi sử dụng!'}), 403
-
-        # Kiểm tra key có thuộc về user này không
-        if not can_use_key(key, user_id):
-            return jsonify({'error': 'KEY này đã được sử dụng bởi thiết bị/người dùng khác!'}), 403
-
-        # Kiểm tra loại mã có hợp lệ không
-        if type_code not in BYPASS_TYPES:
-            return jsonify({'error': f'Loại không hợp lệ. Các loại hỗ trợ: {", ".join(BYPASS_TYPES)}'}), 400
-
-        # Lấy mã bằng hàm get_bypass_code
-        code = get_bypass_code(type_code)
-        
-        if code:
-            return jsonify({'code': code}), 200
-        else:
-            return jsonify({'error': 'Không thể lấy được mã. Vui lòng thử lại sau.'}), 400
+if FLASK_AVAILABLE and app is not None:
+    @app.route('/bypass', methods=['POST'])
+    def k():
+        try:
+            json_data = request.get_json()
+            if not json_data:
+                return jsonify({'error': 'Không có dữ liệu'}), 400
+            type_code = json_data.get('type')
+            user_id = json_data.get('user_id')
+            key = json_data.get('key') or None
             
-    except Exception as e:
-        logger.error(f"Lỗi bypass: {e}")
-        return jsonify({'error': f"Lỗi hệ thống: {str(e)}"}), 500
+            # Nếu không có key từ request, lấy key từ user
+            if key is None and user_id is not None:
+                key = USER_KEYS.get(user_id)
+            
+            if not type_code:
+                return jsonify({'error': 'Thiếu trường type'}), 400
+            if not key or not check_key(key):
+                return jsonify({'error': 'Bạn phải xác nhận KEY hợp lệ trước khi sử dụng!'}), 403
 
-@app.route('/genkey', methods=['POST', 'GET'])
-def apikey():
-    try:
-        key, lifetime = tao_key()
-        link_raw = upload(key)
-        if not link_raw:
-            return jsonify({'error': 'Không upload được lên Dpaste.org'}), 500
-        short = rutgon(link_raw)
-        return jsonify({
-            'short_link': short if short else link_raw,
-            'original_link': link_raw,
-            'key': key
-        }), 200
-    except Exception as e:
-        logger.error(f"Lỗi genkey: {e}")
-        return jsonify({'error': f"Lỗi hệ thống: {str(e)}"}), 500
+            # Kiểm tra key có thuộc về user này không
+            if not can_use_key(key, user_id):
+                return jsonify({'error': 'KEY này đã được sử dụng bởi thiết bị/người dùng khác!'}), 403
 
-@app.route('/', methods=['GET'])
-def index():
-    return render_template_string("<h2>API lấy mã & tạo KEY đang hoạt động!<br>Muốn sử dụng phải xác nhận KEY!</h2>")
+            # Kiểm tra loại mã có hợp lệ không
+            if type_code not in BYPASS_TYPES:
+                return jsonify({'error': f'Loại không hợp lệ. Các loại hỗ trợ: {", ".join(BYPASS_TYPES)}'}), 400
+
+            # Lấy mã bằng hàm get_bypass_code
+            code = get_bypass_code(type_code)
+            
+            if code:
+                return jsonify({'code': code}), 200
+            else:
+                return jsonify({'error': 'Không thể lấy được mã. Vui lòng thử lại sau.'}), 400
+                
+        except Exception as e:
+            logger.error(f"Lỗi bypass: {e}")
+            return jsonify({'error': f"Lỗi hệ thống: {str(e)}"}), 500
+
+    @app.route('/genkey', methods=['POST', 'GET'])
+    def apikey():
+        try:
+            key, lifetime = tao_key()
+            link_raw = upload(key)
+            if not link_raw:
+                return jsonify({'error': 'Không upload được lên Dpaste.org'}), 500
+            short = rutgon(link_raw)
+            return jsonify({
+                'short_link': short if short else link_raw,
+                'original_link': link_raw,
+                'key': key
+            }), 200
+        except Exception as e:
+            logger.error(f"Lỗi genkey: {e}")
+            return jsonify({'error': f"Lỗi hệ thống: {str(e)}"}), 500
+
+    @app.route('/', methods=['GET'])
+    def index():
+        return render_template_string("""
+        <h1 style='color: #FF6B35; text-align: center; font-family: Arial;'>
+            ⚡ BÓNG X PREMIUM API ⚡
+        </h1>
+        <h2 style='color: #333; text-align: center; font-family: Arial;'>
+            🏅 API lấy mã & tạo KEY đang hoạt động!<br>
+            💎 Muốn sử dụng phải xác nhận KEY!<br>
+            🌟 Bóng X - Công nghệ thông minh thành công
+        </h2>
+        <div style='text-align: center; margin-top: 20px;'>
+            <p style='color: #666; font-style: italic;'>Powered by Bóng X Premium Technology</p>
+        </div>
+        """)
+
+# Else cho FLASK_AVAILABLE
+else:
+    # Các hàm stub khi Flask không có sẵn
+    def k():
+        return {"error": "Flask not available"}
+    
+    def apikey():
+        return {"error": "Flask not available"}
+    
+    def index():
+        return "Flask not available"
 
 def start_flask():
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    """Khởi động Flask server nếu có sẵn"""
+    if not FLASK_AVAILABLE or app is None:
+        logger.warning("Flask không có sẵn - Web API bị vô hiệu hóa")
+        return
+    
+    try:
+        app.run(host="0.0.0.0", port=5000, threaded=True)
+    except Exception as e:
+        logger.error(f"Lỗi khởi động Flask server: {e}")
 
 # ========== AUTO CLEANUP SYSTEM ==========
 def auto_cleanup_scheduler():
@@ -2385,6 +2755,7 @@ def load_all_data():
     logger.info(f"✅ Đã load hoàn tất - Dọn dẹp {cleaned} KEY hết hạn")
 
 # ========== LỆNH INFO HỆ THỐNG ==========
+@check_bot_active()
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "User"
@@ -2396,13 +2767,13 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_bypass_types = len(BYPASS_TYPES)
     
     info_text = (
-        f"🚀 <b>YEUMONEY BYPASS PRO</b> 🚀\n"
+        f"🚀 <b>BÓNG X PREMIUM</b> 🚀\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <i>Thông tin hệ thống chi tiết</i> 📊\n\n"
         
         f"🌟 <b>THÔNG TIN HỆ THỐNG</b>\n"
         f"╔═════════════════════════════════╗\n"
-        f"║ 🎯 Tên: <b>YEUMONEY BYPASS PRO</b>    ║\n"
+        f"║ 🎯 Tên: <b>BÓNG X PREMIUM</b>    ║\n"
         f"║ 🏆 Phiên bản: <b>v2.0 Premium</b>    ║\n"
         f"║ 🛡️ Bảo mật: <b>Advanced SSL</b>      ║\n"
         f"║ ⚡ Tốc độ: <b>Ultra Fast</b>         ║\n"
@@ -2450,6 +2821,360 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_html(info_text)
 
+# ========== BOT CONTROL COMMANDS ==========
+
+@check_bot_active(['batbot'])
+async def batbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh bật bot (chỉ Master Admin)"""
+    user_id = update.effective_user.id
+    
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html(
+            "🚫 <b>QUYỀN TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
+            "Chỉ Master Admin mới có quyền bật/tắt bot."
+        )
+        return
+    
+    if is_bot_active():
+        await update.message.reply_html(
+            "✅ <b>BOT ĐÃ ĐANG HOẠT ĐỘNG</b>\n\n"
+            "Bot hiện tại đang trong trạng thái bật."
+        )
+        return
+    
+    toggle_bot_status(True, user_id)
+    
+    # Gửi thông báo cho tất cả
+    broadcast_msg = (
+        "🔔 <b>THÔNG BÁO HỆ THỐNG</b>\n\n"
+        "✅ Bot đã được <b>BẬT LẠI</b> và sẵn sàng phục vụ!\n\n"
+        f"⏰ Thời gian: {dt.now().strftime('%H:%M:%S %d/%m/%Y')}\n"
+        f"👑 Bởi: Master Admin"
+    )
+    
+    await send_broadcast_async(context.application, broadcast_msg)
+    
+    await update.message.reply_html(
+        "✅ <b>ĐÃ BẬT BOT THÀNH CÔNG</b>\n\n"
+        "Bot đã được bật và thông báo đã được gửi tới tất cả người dùng."
+    )
+
+@check_bot_active(['tatbot'])
+async def tatbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh tắt bot (chỉ Master Admin)"""
+    user_id = update.effective_user.id
+    
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html(
+            "🚫 <b>QUYỀN TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
+            "Chỉ Master Admin mới có quyền bật/tắt bot."
+        )
+        return
+    
+    if not is_bot_active():
+        await update.message.reply_html(
+            "⏸️ <b>BOT ĐÃ ĐANG TẮT</b>\n\n"
+            "Bot hiện tại đang trong trạng thái tắt."
+        )
+        return
+    
+    # Gửi thông báo trước khi tắt
+    broadcast_msg = (
+        "🔔 <b>THÔNG BÁO HỆ THỐNG</b>\n\n"
+        "⏸️ Bot sẽ <b>TẠM NGỪNG HOẠT ĐỘNG</b> để bảo trì.\n\n"
+        f"⏰ Thời gian: {dt.now().strftime('%H:%M:%S %d/%m/%Y')}\n"
+        f"👑 Bởi: Master Admin\n\n"
+        "📞 Liên hệ admin nếu cần hỗ trợ khẩn cấp."
+    )
+    
+    await send_broadcast_async(context.application, broadcast_msg)
+    
+    toggle_bot_status(False, user_id)
+    
+    await update.message.reply_html(
+        "⏸️ <b>ĐÃ TẮT BOT THÀNH CÔNG</b>\n\n"
+        "Bot đã được tắt và thông báo đã được gửi tới tất cả người dùng."
+    )
+
+@check_bot_active(['hentacbot'])
+async def hentacbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hẹn tắt bot (chỉ Master Admin)"""
+    user_id = update.effective_user.id
+    
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html(
+            "🚫 <b>QUYỀN TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
+            "Chỉ Master Admin mới có quyền sử dụng lệnh này."
+        )
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_html(
+            "📝 <b>HƯỚNG DẪN SỬ DỤNG</b>\n\n"
+            "<code>/hentacbot &lt;phút&gt;</code> - Hẹn tắt sau X phút\n"
+            "<code>/hentacbot &lt;giờ&gt;:&lt;phút&gt;</code> - Hẹn tắt vào giờ cụ thể hôm nay\n"
+            "<code>/hentacbot &lt;ngày&gt;/&lt;tháng&gt; &lt;giờ&gt;:&lt;phút&gt;</code> - Hẹn tắt vào ngày giờ cụ thể\n\n"
+            "🌟 <b>VÍ DỤ:</b>\n"
+            "• <code>/hentacbot 30</code> - Tắt sau 30 phút\n"
+            "• <code>/hentacbot 14:30</code> - Tắt lúc 14:30 hôm nay\n"
+            "• <code>/hentacbot 25/12 09:00</code> - Tắt lúc 9:00 ngày 25/12"
+        )
+        return
+    
+    try:
+        schedule_text = ' '.join(args)
+        scheduled_time = parse_schedule_time(schedule_text)
+        
+        if scheduled_time <= time.time():
+            await update.message.reply_html(
+                "⚠️ <b>THỜI GIAN KHÔNG HỢP LỆ</b>\n\n"
+                "Không thể hẹn giờ trong quá khứ!"
+            )
+            return
+        
+        task_id = schedule_bot_toggle('off', scheduled_time, user_id)
+        time_str = dt.fromtimestamp(scheduled_time).strftime('%H:%M:%S %d/%m/%Y')
+        
+        await update.message.reply_html(
+            f"⏰ <b>ĐÃ HẸN TẮT BOT</b>\n\n"
+            f"🕒 Thời gian: <code>{time_str}</code>\n"
+            f"🆔 Mã lịch: <code>{task_id}</code>\n\n"
+            f"✅ Bot sẽ tự động tắt vào thời gian đã hẹn.\n"
+            f"📢 Thông báo sẽ được gửi tới tất cả người dùng."
+        )
+        
+    except ValueError as e:
+        await update.message.reply_html(
+            f"❌ <b>LỖI ĐỊNH DẠNG THỜI GIAN</b>\n\n"
+            f"Chi tiết: {str(e)}\n\n"
+            "Vui lòng kiểm tra lại định dạng thời gian."
+        )
+
+@check_bot_active(['henbatbot'])
+async def henbatbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hẹn bật bot (chỉ Master Admin)"""
+    user_id = update.effective_user.id
+    
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html(
+            "🚫 <b>QUYỀN TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
+            "Chỉ Master Admin mới có quyền sử dụng lệnh này."
+        )
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_html(
+            "📝 <b>HƯỚNG DẪN SỬ DỤNG</b>\n\n"
+            "<code>/henbatbot &lt;phút&gt;</code> - Hẹn bật sau X phút\n"
+            "<code>/henbatbot &lt;giờ&gt;:&lt;phút&gt;</code> - Hẹn bật vào giờ cụ thể hôm nay\n"
+            "<code>/henbatbot &lt;ngày&gt;/&lt;tháng&gt; &lt;giờ&gt;:&lt;phút&gt;</code> - Hẹn bật vào ngày giờ cụ thể\n\n"
+            "🌟 <b>VÍ DỤ:</b>\n"
+            "• <code>/henbatbot 60</code> - Bật sau 60 phút\n"
+            "• <code>/henbatbot 08:00</code> - Bật lúc 8:00 sáng hôm nay\n"
+            "• <code>/henbatbot 01/01 00:00</code> - Bật lúc 0:00 ngày 1/1"
+        )
+        return
+    
+    try:
+        schedule_text = ' '.join(args)
+        scheduled_time = parse_schedule_time(schedule_text)
+        
+        if scheduled_time <= time.time():
+            await update.message.reply_html(
+                "⚠️ <b>THỜI GIAN KHÔNG HỢP LỆ</b>\n\n"
+                "Không thể hẹn giờ trong quá khứ!"
+            )
+            return
+        
+        task_id = schedule_bot_toggle('on', scheduled_time, user_id)
+        time_str = dt.fromtimestamp(scheduled_time).strftime('%H:%M:%S %d/%m/%Y')
+        
+        await update.message.reply_html(
+            f"⏰ <b>ĐÃ HẸN BẬT BOT</b>\n\n"
+            f"🕒 Thời gian: <code>{time_str}</code>\n"
+            f"🆔 Mã lịch: <code>{task_id}</code>\n\n"
+            f"✅ Bot sẽ tự động bật vào thời gian đã hẹn.\n"
+            f"📢 Thông báo sẽ được gửi tới tất cả người dùng."
+        )
+        
+    except ValueError as e:
+        await update.message.reply_html(
+            f"❌ <b>LỖI ĐỊNH DẠNG THỜI GIAN</b>\n\n"
+            f"Chi tiết: {str(e)}\n\n"
+            "Vui lòng kiểm tra lại định dạng thời gian."
+        )
+
+@check_bot_active(['danhsachlichhen'])
+async def danhsachlichhen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xem danh sách lịch hẹn (chỉ Master Admin)"""
+    user_id = update.effective_user.id
+    
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html(
+            "🚫 <b>QUYỀN TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
+            "Chỉ Master Admin mới có quyền xem lịch hẹn."
+        )
+        return
+    
+    tasks = get_scheduled_tasks()
+    
+    if not tasks:
+        await update.message.reply_html(
+            "📋 <b>DANH SÁCH LỊCH HẸN</b>\n\n"
+            "❌ Hiện tại không có lịch hẹn nào."
+        )
+        return
+    
+    message = "📋 <b>DANH SÁCH LỊCH HẸN</b>\n\n"
+    
+    for task_id, task_info in tasks.items():
+        action_text = "🔴 TẮT BOT" if task_info['action'] == 'off' else "🟢 BẬT BOT"
+        scheduled_time_str = dt.fromtimestamp(task_info['scheduled_time']).strftime('%H:%M:%S %d/%m/%Y')
+        created_time_str = dt.fromtimestamp(task_info['created_at']).strftime('%H:%M %d/%m')
+        
+        message += (
+            f"🆔 <code>{task_id}</code>\n"
+            f"⚡ Hành động: {action_text}\n"
+            f"⏰ Thời gian thực hiện: <code>{scheduled_time_str}</code>\n"
+            f"📅 Tạo lúc: <code>{created_time_str}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+    
+    message += f"📊 Tổng cộng: <b>{len(tasks)}</b> lịch hẹn đang chờ thực hiện."
+    
+    await update.message.reply_html(message)
+
+@check_bot_active(['huylichhen'])
+async def huylichhen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hủy lịch hẹn (chỉ Master Admin)"""
+    user_id = update.effective_user.id
+    
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html(
+            "🚫 <b>QUYỀN TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
+            "Chỉ Master Admin mới có quyền hủy lịch hẹn."
+        )
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_html(
+            "📝 <b>HƯỚNG DẪN SỬ DỤNG</b>\n\n"
+            "<code>/huylichhen &lt;mã_lịch&gt;</code>\n\n"
+            "Sử dụng <code>/danhsachlichhen</code> để xem mã lịch."
+        )
+        return
+    
+    task_id = args[0]
+    
+    if cancel_scheduled_task(task_id):
+        await update.message.reply_html(
+            f"✅ <b>ĐÃ HỦY LỊCH HẸN</b>\n\n"
+            f"🆔 Mã lịch: <code>{task_id}</code>\n"
+            f"📅 Thời gian hủy: <code>{dt.now().strftime('%H:%M:%S %d/%m/%Y')}</code>"
+        )
+    else:
+        await update.message.reply_html(
+            f"❌ <b>KHÔNG TÌM THẤY LỊCH HẸN</b>\n\n"
+            f"🆔 Mã lịch: <code>{task_id}</code>\n\n"
+            "Lịch hẹn có thể đã được thực hiện hoặc không tồn tại."
+        )
+
+@check_bot_active(['thongbao'])
+async def thongbao_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gửi thông báo tới tất cả (chỉ Master Admin)"""
+    user_id = update.effective_user.id
+    
+    if user_id != MASTER_ADMIN_ID:
+        await update.message.reply_html(
+            "🚫 <b>QUYỀN TRUY CẬP BỊ TỪ CHỐI</b>\n\n"
+            "Chỉ Master Admin mới có quyền gửi thông báo chung."
+        )
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_html(
+            "📝 <b>HƯỚNG DẪN SỬ DỤNG</b>\n\n"
+            "<code>/thongbao &lt;tin_nhắn&gt;</code>\n\n"
+            "🌟 <b>VÍ DỤ:</b>\n"
+            "<code>/thongbao Hệ thống sẽ bảo trì từ 14:00-15:00 hôm nay.</code>"
+        )
+        return
+    
+    message_text = ' '.join(args)
+    
+    broadcast_msg = (
+        "📢 <b>THÔNG BÁO QUAN TRỌNG</b>\n\n"
+        f"{message_text}\n\n"
+        f"⏰ Thời gian: {dt.now().strftime('%H:%M:%S %d/%m/%Y')}\n"
+        f"👑 Từ: Master Admin"
+    )
+    
+    await send_broadcast_async(context.application, broadcast_msg)
+    
+    await update.message.reply_html(
+        "📢 <b>ĐÃ GỬI THÔNG BÁO</b>\n\n"
+        f"📝 Nội dung: <i>{message_text}</i>\n\n"
+        "✅ Thông báo đã được gửi tới tất cả người dùng."
+    )
+
+def parse_schedule_time(schedule_text):
+    """Parse thời gian từ text thành timestamp"""
+    now = dt.now()
+    
+    # Nếu chỉ là số (phút)
+    if schedule_text.isdigit():
+        minutes = int(schedule_text)
+        if minutes <= 0 or minutes > 10080:  # Max 1 tuần
+            raise ValueError("Số phút phải từ 1 đến 10080 (1 tuần)")
+        return time.time() + (minutes * 60)
+    
+    # Nếu là giờ:phút (hôm nay)
+    if ':' in schedule_text and '/' not in schedule_text:
+        try:
+            hour, minute = map(int, schedule_text.split(':'))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("Giờ phải từ 0-23, phút từ 0-59")
+            
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            
+            # Nếu thời gian đã qua trong ngày, chuyển sang ngày mai
+            if target <= now:
+                target += timedelta(days=1)
+            
+            return target.timestamp()
+        except:
+            raise ValueError("Định dạng giờ:phút không hợp lệ")
+    
+    # Nếu là ngày/tháng giờ:phút
+    if '/' in schedule_text and ':' in schedule_text:
+        try:
+            parts = schedule_text.split()
+            date_part = parts[0]  # dd/mm
+            time_part = parts[1]  # hh:mm
+            
+            day, month = map(int, date_part.split('/'))
+            hour, minute = map(int, time_part.split(':'))
+            
+            if not (1 <= day <= 31 and 1 <= month <= 12 and 0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("Ngày/tháng/giờ/phút không hợp lệ")
+            
+            year = now.year
+            target = dt(year, month, day, hour, minute, 0)
+            
+            # Nếu thời gian đã qua trong năm, chuyển sang năm sau
+            if target <= now:
+                target = target.replace(year=year + 1)
+            
+            return target.timestamp()
+        except:
+            raise ValueError("Định dạng ngày/tháng giờ:phút không hợp lệ")
+    
+    raise ValueError("Định dạng thời gian không được hỗ trợ")
+
 # ========== ĐĂNG KÝ LỆNH BOT ==========
 async def set_bot_commands(application):
     commands = [
@@ -2473,6 +3198,15 @@ async def set_bot_commands(application):
         BotCommand("deleteallkeys", "💥 [Master] Xóa tất cả KEY"),
         BotCommand("adminguide", "👑 [Admin] Hướng dẫn admin"),
         BotCommand("savedata", "💾 [Admin] Backup dữ liệu"),
+        
+        # Bot Control Commands (Master Admin Only)
+        BotCommand("batbot", "🟢 [Master] Bật bot"),
+        BotCommand("tatbot", "🔴 [Master] Tắt bot"),
+        BotCommand("hentacbot", "⏰ [Master] Hẹn tắt bot"),
+        BotCommand("henbatbot", "⏰ [Master] Hẹn bật bot"),
+        BotCommand("danhsachlichhen", "📋 [Master] Xem lịch hẹn"),
+        BotCommand("huylichhen", "❌ [Master] Hủy lịch hẹn"),
+        BotCommand("thongbao", "📢 [Master] Gửi thông báo chung"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -2480,6 +3214,9 @@ async def set_bot_commands(application):
 if __name__ == "__main__":
     # Tải dữ liệu từ file khi khởi động
     load_all_data()
+    
+    # Khởi động lại các scheduled tasks
+    restart_scheduled_tasks()
     
     # Khởi động hệ thống tự động dọn dẹp KEY
     start_auto_cleanup()
@@ -2495,6 +3232,9 @@ if __name__ == "__main__":
     
     # Khởi động bot
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Set global APPLICATION context để có thể gửi broadcast
+    APPLICATION = application
     
     # Đăng ký các handler
     application.add_handler(CommandHandler("start", start_command))
@@ -2515,11 +3255,26 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler(["ban", "unban", "addadmin", "deladmin", "adminguide"], ym_command))
     
+    # Bot Control Commands (Master Admin Only)
+    application.add_handler(CommandHandler("batbot", batbot_command))
+    application.add_handler(CommandHandler("tatbot", tatbot_command))
+    application.add_handler(CommandHandler("hentacbot", hentacbot_command))
+    application.add_handler(CommandHandler("henbatbot", henbatbot_command))
+    application.add_handler(CommandHandler("danhsachlichhen", danhsachlichhen_command))
+    application.add_handler(CommandHandler("huylichhen", huylichhen_command))
+    application.add_handler(CommandHandler("thongbao", thongbao_command))
+    
     # Thiết lập menu lệnh
     application.post_init = set_bot_commands
+    
+    bot_status = "🟢 HOẠT ĐỘNG" if is_bot_active() else "🔴 TẮT"
+    scheduled_tasks_count = len(get_scheduled_tasks())
     
     logger.info(f"🚀 Bot KEY System Professional đã khởi động!")
     logger.info(f"🔑 KEY lifetime: 24 giờ chính xác")
     logger.info(f"🧹 Auto cleanup: mỗi {KEY_CLEANUP_INTERVAL//60} phút")
     logger.info(f"⏰ KEY cooldown: {KEY_COOLDOWN_TIME//3600} giờ")
+    logger.info(f"🎛️ Bot status: {bot_status}")
+    logger.info(f"📋 Scheduled tasks: {scheduled_tasks_count}")
+    logger.info(f"👑 Master Admin: {MASTER_ADMIN_ID}")
     application.run_polling()

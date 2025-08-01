@@ -479,7 +479,7 @@ def get_bypass_code(type_code):
                 'pattern': 'layma_me_vuatraffic'
             },
             '188bet': {
-                'url': 'https://traffic-user.net/GET_MA.php?codexn=taodeptrailamnhe&url=https://88betag.com/keo-moneyline-la-gi/&loai_traffic=https://88betag.com/&clk=1000',
+                'url': 'https://traffic-user.net/GET_MA.php?codexn=taodeptrailamnhe&url=https://88bet.hiphop/keo-moneyline-la-gi/&loai_traffic=https://88bet.hiphop/&clk=1000',
                 'pattern': 'layma_me_vuatraffic'
             },
             'w88': {
